@@ -17,20 +17,33 @@ import (
 // go:generate go get -u github.com/go-bindata/go-bindata/...
 // go:generate go-bindata -o viz.go -nomemcopy ./viz.js
 
-func caputureReader(in chan<- string, r io.Reader) {
-	defer close(in)
+func captureReader(out chan<- string, in io.Reader) {
+	defer close(out)
 
-	s := bufio.NewScanner(r)
-	s.Split(bufio.ScanLines)
+	r := bufio.NewReader(in)
 
-	for s.Scan() {
-		in <- s.Text()
+	for {
+		chunk, err := r.ReadString('\n')
+		if err != nil {
+			if err != io.EOF {
+				fmt.Fprintf(os.Stderr, "%+v", err)
+			}
+			return
+		}
+
+		out <- chunk
 	}
 }
 
-func signalf(sig chan os.Signal, err error) {
-	fmt.Fprintf(os.Stderr, "%+v", err)
-	sig <- os.Interrupt
+func captureWriter(in <-chan string, out io.Writer) {
+	for {
+		chunk, ok := <-in
+		if !ok {
+			return
+		}
+
+		fmt.Fprint(os.Stdout, chunk)
+	}
 }
 
 func main() {
@@ -49,15 +62,16 @@ func main() {
 	}
 	defer l.Close()
 
-	chunks := ""
-	chunksWg := &sync.WaitGroup{}
-	chunksWg.Add(1)
+	file := ""
+	boot := &sync.WaitGroup{}
+	boot.Add(1)
 
 	stdin := make(chan string)
-	go caputureReader(stdin, os.Stdin)
+	stdout := make(chan string)
+	go captureReader(stdin, os.Stdin)
+	go captureWriter(stdout, os.Stdout)
 	go func(doPipeOut bool) {
-		defer chunksWg.Done()
-
+		defer boot.Done()
 		for {
 			select {
 			case <-ctx.Done():
@@ -66,30 +80,32 @@ func main() {
 				if !ok {
 					return
 				}
-				chunks = fmt.Sprintf("%s%s", chunks, chunk)
+				file = fmt.Sprintf("%s%s", file, chunk)
 
 				if doPipeOut {
-					print(chunk)
+					stdout <- chunk
 				}
 			}
 		}
 	}(*pipeOut)
 	go func() {
-		chunksWg.Wait()
+		boot.Wait()
 
 		select {
 		case <-ctx.Done():
 			return
 		default:
 			http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-				htmlPageTemplate.Execute(w, chunks)
+				htmlPageTemplate.Execute(w, fmt.Sprintf("`%s`", file))
 			})
+
 			err := http.Serve(l, nil)
+			sig <- os.Interrupt
+
 			if err != nil {
-				signalf(sig, err)
+				fmt.Fprintf(os.Stderr, "%+v", err)
 				return
 			}
-			sig <- os.Interrupt
 		}
 	}()
 
@@ -100,8 +116,23 @@ var (
 	address          = flag.String("addr", "localhost:8080", "set the listen address ip:port")
 	pipeOut          = flag.Bool("p", false, "enable piping, writes the stdin to stdout")
 	htmlPageTemplate = MustParsef(`<html>
-		%s
-	</html>`, string(MustAsset("viz.js")))
+		<head>
+			<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+			<meta charset="utf-8">
+			<title>Viztree</title>
+		</head>
+
+		<body>
+			<div id="graph"></div>
+		</body>
+		
+		<script language="javascript" type="text/javascript">%s</script>
+		<script language="javascript">
+			(function() {
+				document.getElementById("graph).innerHTML = Viz({{.}}, "svg");
+			})();
+		</script>
+	</html>`, MustAsset("viz.js"))
 )
 
 func MustParsef(format string, args ...interface{}) *template.Template {
